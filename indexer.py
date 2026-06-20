@@ -107,7 +107,9 @@ def fingerprint_song(song_path):
 def main():
     # Target all mp3s except a potential query file
     songs = [
-        f for f in os.listdir("./songs") if f.endswith(".mp3") and f != "query.mp3"
+        f
+        for f in os.listdir(config.SONG_DIR)
+        if f.endswith(".mp3") and f != "query.mp3"
     ]
 
     if not songs:
@@ -124,7 +126,7 @@ def main():
         for song in songs:
             print(f"Indexing: {song}...")
             try:
-                hashes = fingerprint_song("./songs/" + song)
+                hashes = fingerprint_song(config.SONG_DIR + song)
                 # Build all rows for this song up front and flush them in
                 # one call instead of one writerow() per hash.
                 rows = [[f1, f2, dt, song, anchor] for (f1, f2, dt), anchor in hashes]
