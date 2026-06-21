@@ -32,7 +32,7 @@ The project consists of two major stages:
 Install the required dependencies:
 
 ```bash
-pip install numpy scipy librosa matplotlib streamlit
+pip install -r requirements.txt
 ```
 
 ---
