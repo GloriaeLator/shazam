@@ -1,19 +1,16 @@
-import csv
-import json
-import os
 
-import config
-import librosa
-import matplotlib.pyplot as plt
+import os
 import numpy as np
+import librosa
 from scipy.ndimage import maximum_filter
 from scipy.signal import spectrogram
+import config
 
+DB_PATH = config.DB_FILE.replace('.csv', '.npz')
 
 def load_audio(path):
     audio, fs = librosa.load(path, sr=config.TARGET_FS, mono=True)
     return fs, audio
-
 
 def get_spectrogram(audio, fs):
     f, t, Sxx = spectrogram(
@@ -26,20 +23,25 @@ def get_spectrogram(audio, fs):
     )
     return 20 * np.log10(Sxx + 1e-10)
 
-
 def get_constellation(S_db):
     local_max = maximum_filter(S_db, size=config.PEAK_SIZE) == S_db
     threshold = np.percentile(S_db, config.PEAK_THRESHOLD)
     peaks = np.argwhere(local_max & (S_db > threshold))
 
-    # Cast to standard int for JSON serialization later
     constellation = [(int(t_idx), int(f_idx)) for f_idx, t_idx in peaks]
     constellation.sort()
     return constellation
 
+def pack_hash(f1, f2, dt):
+    return (np.uint64(f1) << 32) | (np.uint64(f2) << 16) | np.uint64(dt)
 
-def create_hashes(constellation):
+def fingerprint_song(song_path):
+    fs, audio = load_audio(song_path)
+    S_db = get_spectrogram(audio, fs)
+    constellation = get_constellation(S_db)
+
     hashes = []
+    times = []
     for i in range(len(constellation)):
         t1, f1 = constellation[i]
         for j in range(1, config.FAN_OUT + 1):
@@ -49,68 +51,13 @@ def create_hashes(constellation):
             dt = t2 - t1
             if dt <= 0:
                 continue
-            hashes.append(((f1, f2, dt), t1))
-    return hashes
-
-
-def save_precomputed_assets(song_name, S_db, constellation):
-    """
-    Saves a PNG of the constellation map and a JSON of the raw points
-    for instant loading in the Streamlit app.
-    """
-    os.makedirs("assets", exist_ok=True)
-    base_name = os.path.splitext(song_name)[0]
-
-    # 1. Save data for instant overlay rendering
-    data_path = os.path.join("assets", f"{base_name}_data.json")
-    with open(data_path, "w") as f:
-        json.dump({"shape": S_db.shape, "constellation": constellation}, f)
-
-    # 2. Save static PNG
-    png_path = os.path.join("assets", f"{base_name}_constellation.png")
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    time_per_frame = (config.WINDOW_SIZE - config.OVERLAP) / config.TARGET_FS
-
-    if constellation:
-        t_idx, f_idx = zip(*constellation)
-        t_sec = [t * time_per_frame for t in t_idx]
-        ax.scatter(t_sec, f_idx, color="lightgrey", s=10, marker="o")
-
-    ax.set_title(f"Constellation Map: {song_name}")
-    ax.set_xlabel("Time (Seconds)")
-    ax.set_ylabel("Frequency (Bin Index)")
-    ax.grid(True, linestyle="--", alpha=0.5)
-
-    # Force strict axis bounds based on spectrogram length
-    max_time_sec = S_db.shape[1] * time_per_frame
-    ax.set_xlim(0, max_time_sec)
-    ax.set_ylim(0, S_db.shape[0])
-
-    fig.tight_layout()
-    fig.savefig(png_path)
-    plt.close(fig)  # Close figure to free memory during bulk indexing
-
-
-def fingerprint_song(song_path):
-    fs, audio = load_audio(song_path)
-    S_db = get_spectrogram(audio, fs)
-    constellation = get_constellation(S_db)
-
-    # Generate and save instant-load files
-    song_name = os.path.basename(song_path)
-    save_precomputed_assets(song_name, S_db, constellation)
-
-    return create_hashes(constellation)
-
+            hashes.append(pack_hash(f1, f2, dt))
+            times.append(t1)
+            
+    return hashes, times
 
 def main():
-    # Target all mp3s except a potential query file
-    songs = [
-        f
-        for f in os.listdir(config.SONG_DIR)
-        if f.endswith(".mp3") and f != "query.mp3"
-    ]
+    songs = [f for f in os.listdir(config.SONG_DIR) if f.endswith(".mp3") and f != "query.mp3"]
 
     if not songs:
         print("No MP3 files found to index.")
@@ -118,26 +65,41 @@ def main():
 
     print(f"Found {len(songs)} song(s) to index.")
 
-    with open(config.DB_FILE, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        # Header layout
-        writer.writerow(["f1", "f2", "dt", "song_name", "anchor_frame"])
+    all_hashes = []
+    all_anchors = []
+    all_songs = []
+    song_names = []
 
-        for song in songs:
-            print(f"Indexing: {song}...")
-            try:
-                hashes = fingerprint_song(config.SONG_DIR + song)
-                # Build all rows for this song up front and flush them in
-                # one call instead of one writerow() per hash.
-                rows = [[f1, f2, dt, song, anchor] for (f1, f2, dt), anchor in hashes]
-                writer.writerows(rows)
-            except Exception as e:
-                print(f"Error indexing {song}: {e}")
+    for s_id, song in enumerate(songs):
+        print(f"Indexing: {song}...")
+        try:
+            song_names.append(song)
+            hashes, times = fingerprint_song(os.path.join(config.SONG_DIR, song))
+            
+            all_hashes.extend(hashes)
+            all_anchors.extend(times)
+            all_songs.extend([s_id] * len(hashes))
+            
+        except Exception as e:
+            print(f"Error indexing {song}: {e}")
 
-    print(f"\nDatabase successfully saved to '{config.DB_FILE}'")
-    print(f"Precomputed assets saved to './assets/'")
+    print("Sorting and compiling binary database...")
+    all_hashes_arr = np.array(all_hashes, dtype=np.uint64)
+    all_anchors_arr = np.array(all_anchors, dtype=np.int32)
+    all_songs_arr = np.array(all_songs, dtype=np.int32)
 
+    # Pre-sort the database so the matcher doesn't have to
+    sort_idx = np.argsort(all_hashes_arr, kind="stable")
+    
+    np.savez(
+        DB_PATH,
+        db_hashes=all_hashes_arr[sort_idx],
+        db_songs=all_songs_arr[sort_idx],
+        db_anchors=all_anchors_arr[sort_idx],
+        song_names=np.array(song_names, dtype=str),
+    )
+
+    print(f"\nSuper-fast binary database successfully saved to '{DB_PATH}'")
 
 if __name__ == "__main__":
     main()
-###Q29kZSBieSBHbG9yaWFlbGF0b3I=
